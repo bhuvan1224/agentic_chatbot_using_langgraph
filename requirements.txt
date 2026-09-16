@@ -1,0 +1,12 @@
+streamlit
+langgraph
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-groq
+tavily-python
+markdown
+xhtml2pdf
+faiss-cpu
+pypdf
