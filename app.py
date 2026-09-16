@@ -1,9 +1,18 @@
-from backend import (
-    chatbot,
-    get_all_threads,
-    ingest_rag_document,
-    primary_llm 
+import streamlit as st
+# ========================= Page configuration =========================
+# THIS MUST BE THE ABSOLUTE FIRST STREAMLIT COMMAND
+st.set_page_config(
+    page_title="Agentic Chatbot",
+    page_icon="🤖"
 )
+
+import uuid
+import tempfile
+import os
+import json
+import io
+import markdown
+from xhtml2pdf import pisa
 
 from langchain_core.messages import (
     BaseMessage,
@@ -11,29 +20,18 @@ from langchain_core.messages import (
     AIMessage,
     ToolMessage
 )
-
-
 from langgraph.types import Command
 
-import streamlit as st
-import uuid
-import tempfile
-import os
-import json
-
-from backend import chatbot, resume_bot
-
-import markdown
-from xhtml2pdf import pisa
-import io
+from backend import (
+    chatbot,
+    resume_bot,
+    get_all_threads,
+    ingest_rag_document,
+    primary_llm 
+)
 
 def generate_pdf_from_md(md_text):
     """Converts Markdown text into a strict 1-Page ATS-friendly PDF."""
-    
-    import markdown
-    from xhtml2pdf import pisa
-    import io
-    
     raw_html = markdown.markdown(md_text)
     
     styled_html = f"""
@@ -79,18 +77,12 @@ def generate_pdf_from_md(md_text):
     pisa.CreatePDF(io.StringIO(styled_html), dest=pdf_buffer)
     return pdf_buffer.getvalue()
 
-# ========================= Page configuration =========================
-# THIS MUST BE THE ABSOLUTE FIRST STREAMLIT COMMAND
-st.set_page_config(
-    page_title="Agentic Chatbot",
-    page_icon="🤖"
-)
-
 TITLES_FILE = "chat_titles.json"
 
 # ========================= Helper Functions =========================
 
 def format_message_content(content) -> str:
+    """Cleans up raw LLM output, extracting only the readable text."""
     if isinstance(content, str):
         return content
     elif isinstance(content, list):
@@ -103,7 +95,7 @@ def format_message_content(content) -> str:
                     text_parts.append(item["text"])
                 elif "text" in item:
                     text_parts.append(str(item["text"]))
-        return "".join(text_parts)
+        return "".join(text_parts).strip()
     return str(content) if content else ""
 
 
@@ -174,22 +166,14 @@ def add_thread(thread_id):
     if "chat_threads" not in st.session_state:
         st.session_state["chat_threads"] = []
         
-    # Remove it from its current position if it exists
     if thread_id in st.session_state["chat_threads"]:
         st.session_state["chat_threads"].remove(thread_id)
         
-    # Always insert at index 0 (top of the list)
     st.session_state["chat_threads"].insert(0, thread_id)
-        
-    # ONLY insert at the top if it is a brand new chat.
-    # This keeps your history strictly in order!
-    if thread_id not in st.session_state["chat_threads"]:
-        st.session_state["chat_threads"].insert(0, thread_id)
 
 
 def reset_chat():
     st.session_state["thread_id"] = generate_thread_id()
-    st.session_state["message_history"] = []
     st.session_state["pending_hitl"] = None
     add_thread(st.session_state["thread_id"])
 
@@ -309,7 +293,7 @@ def resume_hitl_execution(decision):
                         if clean_text:
                             yield clean_text
 
-            resumed_ai_message = st.write_stream(resumed_ai_only_stream())
+            st.write_stream(resumed_ai_only_stream())
             next_interrupt = get_pending_interrupt(interrupted_thread_id)
 
             if next_interrupt is not None:
@@ -327,12 +311,6 @@ def resume_hitl_execution(decision):
                     expanded=False
                 )
 
-        if resumed_ai_message:
-            st.session_state["message_history"].append({
-                "role": "assistant",
-                "content": resumed_ai_message
-            })
-
         st.rerun()
 
     except Exception as error:
@@ -342,10 +320,6 @@ def resume_hitl_execution(decision):
 # ========================= Main App Initialization =========================
 
 st.title("Agentic Chatbot with LangGraph")
-
-# Session state checks (MUST come after functions are defined)
-if "message_history" not in st.session_state:
-    st.session_state["message_history"] = []
 
 if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
@@ -368,9 +342,6 @@ if st.sidebar.button("New Chat", use_container_width=True):
     reset_chat()
     st.rerun()
 
-# ==========================================
-# 📍 ADD STEP 2 HERE (The Dropdown Switcher)
-# ==========================================
 st.sidebar.markdown("---")
 st.session_state["bot_mode"] = st.sidebar.selectbox(
     "🤖 Choose AI Agent:", 
@@ -379,7 +350,6 @@ st.session_state["bot_mode"] = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 
-# Use list() to safely iterate while allowing deletions
 for thread_id in list(st.session_state["chat_threads"]):
     display_name = get_chat_title(thread_id)
 
@@ -388,35 +358,12 @@ for thread_id in list(st.session_state["chat_threads"]):
     else:
         button_label = f"📄 {display_name}"
 
-    # Split the sidebar into two columns: ~80% for the name, ~20% for the trash can
     col1, col2 = st.sidebar.columns([4, 1])
 
     with col1:
         if st.button(button_label, key=f"select_{thread_id}", use_container_width=True):
             st.session_state["thread_id"] = thread_id
-            
-            # 💡 Bring the selected chat to the top of the list
             add_thread(thread_id)
-
-            messages = load_conversation(thread_id)
-
-            temp_messages = []
-            for message in messages:
-                if isinstance(message, HumanMessage):
-                    role = "user"
-                elif isinstance(message, AIMessage):
-                    role = "assistant"
-                else:
-                    continue
-
-                clean_text = format_message_content(message.content)
-                if clean_text.strip():
-                    temp_messages.append({
-                        "role": role,
-                        "content": clean_text
-                    })
-
-            st.session_state["message_history"] = temp_messages
             sync_pending_interrupt(thread_id)
             st.rerun()
 
@@ -424,14 +371,6 @@ for thread_id in list(st.session_state["chat_threads"]):
         if st.button("🗑️", key=f"delete_{thread_id}", use_container_width=True):
             delete_thread(thread_id)
             st.rerun()
-
-
-# ========================= Main chat interface =========================
-
-for message in st.session_state["message_history"]:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
 
 # ========================= HITL approval interface =========================
 
@@ -469,12 +408,6 @@ if current_thread_has_pending_hitl:
 
 # ========================= Fixed chat input with PDF upload =========================
 
-# ==========================================
-# 1. DRAW CHAT HISTORY FROM LANGGRAPH ONLY
-# ==========================================
-# 💡 FIX: We completely deleted st.session_state["message_history"]. 
-# We now pull directly from LangGraph's database so doubling is impossible.
-
 CONFIG = {
     "configurable": {"thread_id": st.session_state["thread_id"]},
     "metadata": {"thread_id": st.session_state["thread_id"]},
@@ -484,25 +417,28 @@ CONFIG = {
 current_mode = st.session_state.get("bot_mode", "General Assistant")
 active_bot = chatbot if current_mode == "General Assistant" else resume_bot
 
-# Fetch the exact truth from the database
+# Fetch the exact truth from the database and clean dictionary data chunks
 try:
     history_state = active_bot.get_state(CONFIG)
     if "messages" in history_state.values:
         for msg in history_state.values["messages"]:
-            if msg.content and type(msg).__name__ == "HumanMessage":
-                with st.chat_message("user"):
-                    st.markdown(msg.content)
-            elif msg.content and type(msg).__name__ == "AIMessage":
-                # 💡 FIX: Hide raw tool calls like <RAG=rag_tool> from old messages
-                if not ("<RAG=" in msg.content or '{"query"' in msg.content):
+            
+            if type(msg).__name__ == "HumanMessage":
+                clean_text = format_message_content(msg.content)
+                if clean_text:
+                    with st.chat_message("user"):
+                        st.markdown(clean_text)
+                        
+            elif type(msg).__name__ == "AIMessage":
+                clean_text = format_message_content(msg.content)
+                # Hide raw tool calls like <RAG=rag_tool> from old messages
+                if clean_text and not ("<RAG=" in clean_text or '{"query"' in clean_text or "<search=" in clean_text):
                     with st.chat_message("assistant"):
-                        st.markdown(msg.content)
+                        st.markdown(clean_text)
 except Exception:
     pass # Ignore if the thread is brand new and empty
 
-# ==========================================
-# 2. CHAT INPUT & EXECUTION
-# ==========================================
+
 submission = st.chat_input(
     "Type here",
     accept_file=True,
@@ -516,7 +452,6 @@ if submission:
     user_input = submission.text
     uploaded_files = submission.files
 
-    # --- Handle PDF Uploads ---
     if uploaded_files:
         uploaded_pdf = uploaded_files[0]
         temporary_file_path = None
@@ -535,9 +470,7 @@ if submission:
             if temporary_file_path and os.path.exists(temporary_file_path):
                 os.remove(temporary_file_path)
 
-    # --- Handle Text Chat ---
     if user_input:
-        # Draw user input instantly
         with st.chat_message("user"):
             st.markdown(user_input)
 
@@ -559,9 +492,9 @@ if submission:
                                 status_holder["box"].update(label=f"🔧 Using `{tool_name}` …", state="running", expanded=True)
 
                         if isinstance(message_chunk, AIMessage):
-                            clean_text = getattr(message_chunk, "content", "")
+                            # Ensure the streaming chunks pass through the cleaner too!
+                            clean_text = format_message_content(getattr(message_chunk, "content", ""))
                             
-                            # 💡 FIX: Prevent the AI from leaking raw tool tags to the screen while typing
                             if clean_text and not ("<RAG=" in clean_text or '{"query"' in clean_text or "<search=" in clean_text):
                                 yield clean_text
 
@@ -570,7 +503,6 @@ if submission:
                         save_pending_interrupt(st.session_state["thread_id"], pending_interrupt)
                         yield "\n\n⚠️ **This action requires confirmation.**"
 
-                # Run the stream (it handles drawing automatically)
                 st.write_stream(ai_only_stream())
 
                 if status_holder["box"] is not None:
@@ -580,15 +512,13 @@ if submission:
                         status_holder["box"].update(label="✅ Tool finished", state="complete", expanded=False)
 
             else:
-                # --- Resume Builder Logic ---
                 with st.spinner("Analyzing profile..."):
-                    from langchain_core.messages import HumanMessage
-                    
                     result = resume_bot.invoke({"messages": [HumanMessage(content=user_input)]}, config=CONFIG)
                     messages = result.get("messages", [])
-                    ai_message = messages[-1].content if messages else "Error processing resume data."
                     
-                    st.markdown(ai_message)
+                    raw_ai_message = messages[-1].content if messages else "Error processing resume data."
+                    clean_ai_message = format_message_content(raw_ai_message)
+                    st.markdown(clean_ai_message)
 
                     current_state = resume_bot.get_state(CONFIG).values
                     if "tailored_resume" in current_state and current_state["tailored_resume"]:
@@ -600,5 +530,4 @@ if submission:
                             mime="application/pdf"
                         )
         
-        # 💡 FIX: Force a rerun so Streamlit perfectly syncs with LangGraph's Database!
         st.rerun()
