@@ -11,3 +11,4 @@ xhtml2pdf
 faiss-cpu
 pypdf
 langgraph-checkpoint-sqlite
+langchain-tavily
