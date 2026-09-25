@@ -15,7 +15,7 @@ import smtplib
 from email.message import EmailMessage
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(override=True)
 
 # ==============================================================================
 # 1. PAGE SETUP & UI STYLING
@@ -96,17 +96,17 @@ def web_search(query: str) -> str:
 
 @tool
 def send_email_report(recipient: str, subject: str, body_content: str) -> str:
-    """Send a real email report. ONLY use this tool if the user explicitly commands you to email someone."""
+    """Send a real email report using SMTP."""
     import os
     import smtplib
     from email.message import EmailMessage
 
+    # Match these EXACT names with your .env file
     sender_email = os.getenv("SENDER_EMAIL")
     sender_password = os.getenv("SENDER_PASSWORD")
 
-    # 1. Check if the .env variables actually exist
     if not sender_email or not sender_password:
-        return "CRITICAL ERROR: SENDER_EMAIL or SENDER_PASSWORD is missing in the .env file. The email was NOT sent."
+        return "CRITICAL ERROR: SENDER_EMAIL or SENDER_PASSWORD missing in environment. Email NOT sent."
 
     try:
         msg = EmailMessage()
@@ -115,17 +115,13 @@ def send_email_report(recipient: str, subject: str, body_content: str) -> str:
         msg['From'] = sender_email
         msg['To'] = recipient
 
-        # 2. Attempt the actual connection
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(sender_email, sender_password)
             smtp.send_message(msg)
             
-        return f"SUCCESS: A real email was successfully delivered to {recipient}."
-    
-    except smtplib.SMTPAuthenticationError:
-        return "CRITICAL ERROR: Google blocked the login. The SENDER_PASSWORD in your .env file is invalid. You MUST use a 16-digit Google App Password, not your normal Gmail password. The email was NOT sent."
+        return f"SUCCESS: Email delivered to {recipient}."
     except Exception as e:
-        return f"CRITICAL ERROR: Failed to send email. Error details: {str(e)}. The email was NOT sent."
+        return f"CRITICAL ERROR: Failed to send email: {str(e)}"
 
 @tool
 def purchase_stock(ticker: str, amount: float) -> str:
