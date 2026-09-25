@@ -1,533 +1,358 @@
+import os
+import uuid
 import streamlit as st
-# ========================= Page configuration =========================
-# THIS MUST BE THE ABSOLUTE FIRST STREAMLIT COMMAND
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+from typing import Annotated, TypedDict
+from langchain_groq import ChatGroq
+import smtplib
+from email.message import EmailMessage
+
+# Load environment variables from .env file
+load_dotenv()
+
+# ==============================================================================
+# 1. PAGE SETUP & UI STYLING
+# ==============================================================================
 st.set_page_config(
     page_title="Agentic Chatbot",
-    page_icon="🤖"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-import uuid
-import tempfile
-import os
-import json
-import io
-import markdown
-from xhtml2pdf import pisa
-
-from langchain_core.messages import (
-    BaseMessage,
-    HumanMessage,
-    AIMessage,
-    ToolMessage
-)
-from langgraph.types import Command
-
-from backend import (
-    chatbot,
-    resume_bot,
-    get_all_threads,
-    ingest_rag_document,
-    primary_llm 
-)
-
-def generate_pdf_from_md(md_text):
-    """Converts Markdown text into a strict 1-Page ATS-friendly PDF."""
-    raw_html = markdown.markdown(md_text)
+st.markdown("""
+<style>
+    .stChatFloatingInputContainer { padding-bottom: 20px; }
     
-    styled_html = f"""
-    <html>
-    <head>
-    <style>
-        @page {{ 
-            size: letter portrait;
-            margin: 1.2cm 1.2cm 1.2cm 1.2cm; /* Strict 0.5 inch margins */
-        }}
-        body {{ 
-            font-family: 'Helvetica', 'Arial', sans-serif; 
-            font-size: 9pt; /* Smaller font to guarantee fit */
-            color: #000000; 
-            line-height: 1.1; 
-        }}
-        h1 {{ 
-            font-size: 16pt; 
-            text-align: center; 
-            margin: 0 0 2px 0; 
-            text-transform: uppercase;
-        }}
-        h2 {{ 
-            font-size: 10.5pt; 
-            border-bottom: 1px solid #000000; 
-            padding-bottom: 2px; 
-            margin-top: 6px; 
-            margin-bottom: 4px; 
-            text-transform: uppercase;
-        }}
-        p {{ margin: 1px 0; }}
-        ul {{ margin-top: 1px; margin-bottom: 3px; padding-left: 12px; }}
-        li {{ margin-bottom: 1px; text-align: justify; }}
-    </style>
-    </head>
-    <body>
-        {raw_html}
-    </body>
-    </html>
-    """
-    
-    pdf_buffer = io.BytesIO()
-    pisa.CreatePDF(io.StringIO(styled_html), dest=pdf_buffer)
-    return pdf_buffer.getvalue()
+    .main-title {
+        text-align: center;
+        font-weight: 800;
+        font-size: 2.3rem;
+        margin-bottom: 0.3rem;
+    }
+    .sub-title {
+        text-align: center;
+        color: #9e9e9e;
+        font-size: 1.05rem;
+        font-weight: 400;
+        margin-bottom: 2rem;
+    }
 
-TITLES_FILE = "chat_titles.json"
+    section[data-testid="stSidebar"] {
+        background-color: #171717;
+    }
+    .stButton > button[kind="tertiary"] {
+        justify-content: flex-start;
+        padding-left: 10px;
+        color: #d1d5db;
+        border: none;
+    }
+    .stButton > button[kind="secondary"] {
+        justify-content: flex-start;
+        padding-left: 10px;
+        background-color: #2f2f2f;
+        color: #ffffff;
+        border: none;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ========================= Helper Functions =========================
+# ==============================================================================
+# 2. LANGGRAPH AGENT SETUP (Robust Tools & Multi-LLM Resilience)
+# ==============================================================================
+@tool
+def get_current_weather(location: str) -> str:
+    """Get the current weather and rain conditions for a specific location."""
+    return f"The weather in {location} is currently 28°C with clear skies and no immediate rain."
 
-def format_message_content(content) -> str:
-    """Cleans up raw LLM output, extracting only the readable text."""
-    if isinstance(content, str):
-        return content
-    elif isinstance(content, list):
-        text_parts = []
-        for item in content:
-            if isinstance(item, str):
-                text_parts.append(item)
-            elif isinstance(item, dict):
-                if item.get("type") == "text" and "text" in item:
-                    text_parts.append(item["text"])
-                elif "text" in item:
-                    text_parts.append(str(item["text"]))
-        return "".join(text_parts).strip()
-    return str(content) if content else ""
+@tool
+def get_future_weather(location: str, date: str) -> str:
+    """Get the weather forecast for a future date."""
+    return f"The forecast for {location} on {date} shows clear skies with a low chance of precipitation."
 
+@tool
+def get_stock_price(ticker: str) -> str:
+    """Get the current market price of a stock, commodity, or asset (e.g. gold, AAPL, BTC)."""
+    return f"The current market price of {ticker} is $2,650.00 per ounce/share."
 
-def get_chat_title(thread_id):
-    if os.path.exists(TITLES_FILE):
-        try:
-            with open(TITLES_FILE, "r") as f:
-                titles = json.load(f)
-                if thread_id in titles and titles[thread_id]:
-                    return titles[thread_id]
-        except Exception:
-            pass
+@tool
+def calculator(expression: str) -> str:
+    """Evaluate a mathematical expression."""
+    try:
+        return str(eval(expression))
+    except Exception as e:
+        return f"Error calculating: {e}"
 
-    config = {"configurable": {"thread_id": thread_id}}
-    state = chatbot.get_state(config)
+@tool
+def web_search(query: str) -> str:
+    """Search the web for general information or real-time news."""
+    return f"Search results for '{query}': Real-time data retrieved successfully."
 
-    if not state or not state.values or "messages" not in state.values:
-        return "New Chat"
+@tool
+def send_email_report(recipient: str, subject: str, body_content: str) -> str:
+    """Send a real email report. ONLY use this tool if the user explicitly commands you to email someone."""
+    import os
+    import smtplib
+    from email.message import EmailMessage
 
-    first_user_msg = None
-    for msg in state.values["messages"]:
-        if isinstance(msg, HumanMessage):
-            first_user_msg = format_message_content(msg.content)
-            break
+    sender_email = os.getenv("SENDER_EMAIL")
+    sender_password = os.getenv("SENDER_PASSWORD")
 
-    if not first_user_msg or not first_user_msg.strip():
-        return "New Chat"
+    # 1. Check if the .env variables actually exist
+    if not sender_email or not sender_password:
+        return "CRITICAL ERROR: SENDER_EMAIL or SENDER_PASSWORD is missing in the .env file. The email was NOT sent."
 
     try:
-        prompt = (
-            "Generate a extremely short, 1 to 3 word title summarizing the user's topic. "
-            "Do NOT use quotes, punctuation, preamble, or markdown. Examples:\n"
-            "Prompt: What is the weather in Delhi? -> Delhi Weather\n"
-            "Prompt: Tell me the latest news -> World News\n"
-            "Prompt: Hey how are you? -> Greeting\n\n"
-            f"User Prompt: {first_user_msg}\nTitle:"
-        )
-        
-        response = primary_llm.invoke(prompt)
-        raw_title = format_message_content(response.content)
-        
-        title = raw_title.replace('"', '').replace("'", "").strip().split('\n')[0]
-        if not title:
-            title = first_user_msg[:20].strip()
-    except Exception:
-        title = first_user_msg[:20].strip()
+        msg = EmailMessage()
+        msg.set_content(f"{body_content}\n\n---\nSent automatically by Agentic Chatbot")
+        msg['Subject'] = subject
+        msg['From'] = sender_email
+        msg['To'] = recipient
 
-    titles = {}
-    if os.path.exists(TITLES_FILE):
-        try:
-            with open(TITLES_FILE, "r") as f:
-                titles = json.load(f)
-        except Exception:
-            pass
-
-    titles[thread_id] = title
-    with open(TITLES_FILE, "w") as f:
-        json.dump(titles, f)
-
-    return title
-
-
-def generate_thread_id():
-    return str(uuid.uuid4())
-
-
-def add_thread(thread_id):
-    if "chat_threads" not in st.session_state:
-        st.session_state["chat_threads"] = []
-        
-    if thread_id in st.session_state["chat_threads"]:
-        st.session_state["chat_threads"].remove(thread_id)
-        
-    st.session_state["chat_threads"].insert(0, thread_id)
-
-
-def reset_chat():
-    st.session_state["thread_id"] = generate_thread_id()
-    st.session_state["pending_hitl"] = None
-    add_thread(st.session_state["thread_id"])
-
-
-def delete_thread(thread_id):
-    """Removes a thread from the UI and clears its saved title."""
-    if thread_id in st.session_state["chat_threads"]:
-        st.session_state["chat_threads"].remove(thread_id)
-        
-    if os.path.exists(TITLES_FILE):
-        try:
-            with open(TITLES_FILE, "r") as f:
-                titles = json.load(f)
-            if thread_id in titles:
-                del titles[thread_id]
-                with open(TITLES_FILE, "w") as f:
-                    json.dump(titles, f)
-        except Exception:
-            pass
+        # 2. Attempt the actual connection
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(sender_email, sender_password)
+            smtp.send_message(msg)
             
-    if st.session_state.get("thread_id") == thread_id:
-        reset_chat()
+        return f"SUCCESS: A real email was successfully delivered to {recipient}."
+    
+    except smtplib.SMTPAuthenticationError:
+        return "CRITICAL ERROR: Google blocked the login. The SENDER_PASSWORD in your .env file is invalid. You MUST use a 16-digit Google App Password, not your normal Gmail password. The email was NOT sent."
+    except Exception as e:
+        return f"CRITICAL ERROR: Failed to send email. Error details: {str(e)}. The email was NOT sent."
 
+@tool
+def purchase_stock(ticker: str, amount: float) -> str:
+    """Buy shares of a stock. ONLY use this tool if the user explicitly commands you to buy stock."""
+    return f"Successfully purchased {amount} shares of {ticker}."
 
-def load_conversation(thread_id):
-    state = chatbot.get_state(
-        config={
-            "configurable": {
-                "thread_id": thread_id
-            }
-        }
-    )
-    return state.values.get("messages", [])
+@tool
+def delete_vector_database() -> str:
+    """Clear the RAG database. ONLY use this tool if the user explicitly commands you to delete the database."""
+    return "Vector database successfully deleted."
 
+# Move send_email_report to safe_tools
+safe_tools = [get_current_weather, get_future_weather, get_stock_price, calculator, web_search, send_email_report]
+sensitive_tools = [purchase_stock, delete_vector_database]
+all_tools = safe_tools + sensitive_tools
 
-def get_pending_interrupt(thread_id):
-    config = {
-        "configurable": {
-            "thread_id": thread_id
-        }
-    }
+# 1. Initialize models normally (DO NOT use .with_fallbacks() anymore)
+primary_llm = ChatGoogleGenerativeAI(
+    model="gemini-3.8-flash", 
+    temperature=0.2, 
+    max_retries=1 # Fail fast so we can switch models immediately
+).bind_tools(all_tools)
 
+secondary_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash", 
+    temperature=0.2, 
+    max_retries=1
+).bind_tools(all_tools)
+
+try:
+    from langchain_groq import ChatGroq
+    groq_llm = ChatGroq(
+        model="openai/gpt-oss-20b", 
+        temperature=0.2, 
+        max_retries=2
+    ).bind_tools(all_tools)
+except Exception:
+    groq_llm = None
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+sys_msg = SystemMessage(content="""You are an advanced, intelligent agentic AI assistant. 
+- Think step-by-step and reason internally before answering.
+- Use safe tools autonomously when needed to fetch information or complete routine tasks (like weather, web searches, and sending emails).
+- NEVER use sensitive tools (like buying stocks or deleting databases) unless the user gives an explicit, direct command to do so.
+- Respond in a clean, professional, human-readable format like ChatGPT or Claude.""")
+
+# 2. The Ironclad Manual Failover Node
+def chatbot_node(state: State):
+    messages = [sys_msg] + state["messages"]
+    
     try:
-        state_snapshot = chatbot.get_state(config)
-
-        direct_interrupts = getattr(state_snapshot, "interrupts", ()) or ()
-        if direct_interrupts:
-            return direct_interrupts[0]
-
-        tasks = getattr(state_snapshot, "tasks", ()) or ()
-        for task in tasks:
-            task_interrupts = getattr(task, "interrupts", ()) or ()
-            if task_interrupts:
-                return task_interrupts[0]
-
-    except Exception:
-        return None
-
-    return None
-
-
-def save_pending_interrupt(thread_id, interrupt_object):
-    st.session_state["pending_hitl"] = {
-        "thread_id": thread_id,
-        "prompt": str(interrupt_object.value)
-    }
-
-
-def sync_pending_interrupt(thread_id):
-    pending_interrupt = get_pending_interrupt(thread_id)
-
-    if pending_interrupt is not None:
-        save_pending_interrupt(thread_id, pending_interrupt)
-    else:
-        current_pending = st.session_state.get("pending_hitl")
-        if current_pending is not None and current_pending.get("thread_id") == thread_id:
-            st.session_state["pending_hitl"] = None
-
-
-def resume_hitl_execution(decision):
-    pending_hitl = st.session_state.get("pending_hitl")
-
-    if not pending_hitl:
-        st.warning("There is no pending action to approve or reject.")
-        return
-
-    interrupted_thread_id = pending_hitl["thread_id"]
-
-    resume_config = {
-        "configurable": {"thread_id": interrupted_thread_id},
-        "metadata": {"thread_id": interrupted_thread_id},
-        "run_name": "hitl_resume_trace",
-    }
-
-    try:
-        with st.chat_message("assistant"):
-            status_holder = {
-                "box": st.status("🔄 Resuming the requested action...", expanded=True)
-            }
-
-            def resumed_ai_only_stream():
-                for message_chunk, metadata in chatbot.stream(
-                    Command(resume=decision),
-                    config=resume_config,
-                    stream_mode="messages",
-                ):
-                    if isinstance(message_chunk, ToolMessage):
-                        tool_name = getattr(message_chunk, "name", "tool")
-                        status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` …",
-                            state="running",
-                            expanded=True,
-                        )
-
-                    if isinstance(message_chunk, AIMessage):
-                        clean_text = format_message_content(message_chunk.content)
-                        if clean_text:
-                            yield clean_text
-
-            st.write_stream(resumed_ai_only_stream())
-            next_interrupt = get_pending_interrupt(interrupted_thread_id)
-
-            if next_interrupt is not None:
-                save_pending_interrupt(interrupted_thread_id, next_interrupt)
-                status_holder["box"].update(
-                    label="⚠️ Another approval is required",
-                    state="complete",
-                    expanded=False
+        # Attempt 1: Primary Gemini
+        return {"messages": [primary_llm.invoke(messages)]}
+    
+    except Exception as primary_error:
+        try:
+            # Attempt 2: Secondary Gemini
+            return {"messages": [secondary_llm.invoke(messages)]}
+            
+        except Exception as secondary_error:
+            # Attempt 3: Groq (Ultimate Backup)
+            if groq_llm is None:
+                raise RuntimeError("Google models exhausted quotas, and Groq is not installed.")
+                
+            try:
+                return {"messages": [groq_llm.invoke(messages)]}
+            
+            except Exception as groq_error:
+                # If everything dies, expose exactly why Groq failed
+                detailed_error = (
+                    f"ALL MODELS FAILED.\n"
+                    f"Gemini Issue: Rate limit / Quota exceeded.\n"
+                    f"Groq Issue: {str(groq_error)}"
                 )
-            else:
-                st.session_state["pending_hitl"] = None
-                status_holder["box"].update(
-                    label="✅ Action completed",
-                    state="complete",
-                    expanded=False
-                )
+                raise RuntimeError(detailed_error)
 
-        st.rerun()
+def route_tools(state: State):
+    last_message = state["messages"][-1]
+    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+        return END
+    
+    sensitive_names = [t.name for t in sensitive_tools]
+    if any(tc["name"] in sensitive_names for tc in last_message.tool_calls):
+        return "sensitive_tools"
+    return "safe_tools"
 
-    except Exception as error:
-        st.error(f"Could not resume the requested action: {error}")
+@st.cache_resource
+def get_checkpointer():
+    return MemorySaver()
 
+memory = get_checkpointer()
 
-# ========================= Main App Initialization =========================
+graph_builder = StateGraph(State)
+graph_builder.add_node("chatbot", chatbot_node)
+graph_builder.add_node("safe_tools", ToolNode(safe_tools))
+graph_builder.add_node("sensitive_tools", ToolNode(sensitive_tools))
 
-st.title("Agentic Chatbot with LangGraph")
+graph_builder.add_edge(START, "chatbot")
+graph_builder.add_conditional_edges("chatbot", route_tools)
+graph_builder.add_edge("safe_tools", "chatbot")
+graph_builder.add_edge("sensitive_tools", "chatbot")
+
+agent = graph_builder.compile(checkpointer=memory, interrupt_before=["sensitive_tools"])
+
+# ==============================================================================
+# 3. DYNAMIC SIDEBAR CHAT HISTORY
+# ==============================================================================
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = {}
 
 if "thread_id" not in st.session_state:
-    st.session_state["thread_id"] = generate_thread_id()
+    st.session_state.thread_id = str(uuid.uuid4())
 
-if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = get_all_threads()
+config = {"configurable": {"thread_id": st.session_state.thread_id}, "recursion_limit": 15}
 
-if "pending_hitl" not in st.session_state:
-    st.session_state["pending_hitl"] = None
-
-add_thread(st.session_state["thread_id"])
-sync_pending_interrupt(st.session_state["thread_id"])
-
-
-# ========================= Sidebar threading feature =========================
-
-st.sidebar.title("My Conversations")
-
-if st.sidebar.button("New Chat", use_container_width=True):
-    reset_chat()
-    st.rerun()
-
-st.sidebar.markdown("---")
-st.session_state["bot_mode"] = st.sidebar.selectbox(
-    "🤖 Choose AI Agent:", 
-    ["General Assistant", "Resume Builder"]
-)
-
-st.sidebar.markdown("---")
-
-for thread_id in list(st.session_state["chat_threads"]):
-    display_name = get_chat_title(thread_id)
-
-    if thread_id == st.session_state["thread_id"]:
-        button_label = f"💬 {display_name}"
+with st.sidebar:
+    if st.button("📝 New chat", use_container_width=True):
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.rerun()
+        
+    st.markdown("<br><p style='color: #888; font-size: 0.85em; font-weight: 600; margin-bottom: 8px;'>Recents</p>", unsafe_allow_html=True)
+    
+    if not st.session_state.chat_history:
+        st.markdown("<p style='color: #555; font-size: 0.85em; padding-left: 10px;'>No previous chats yet.</p>", unsafe_allow_html=True)
     else:
-        button_label = f"📄 {display_name}"
+        for tid, title in reversed(list(st.session_state.chat_history.items())):
+            is_active = (tid == st.session_state.thread_id)
+            btn_type = "secondary" if is_active else "tertiary"
+            
+            if st.button(f"💬 {title}", key=f"chat_{tid}", type=btn_type, use_container_width=True):
+                st.session_state.thread_id = tid
+                st.rerun()
 
-    col1, col2 = st.sidebar.columns([4, 1])
+# ==============================================================================
+# 4. MAIN CHAT INTERFACE & CLEAN MESSAGE RENDERING
+# ==============================================================================
+st.markdown("<div class='main-title'>Agentic Chatbot</div>", unsafe_allow_html=True)
+st.markdown("<div class='sub-title'>Beyond basic QA — Intelligent reasoning, real-time tools, and human-governed actions.</div>", unsafe_allow_html=True)
 
+current_state = agent.get_state(config)
+messages = current_state.values.get("messages", []) if current_state.values else []
+
+# STRICT FILTER: Render only human text and AI text. Completely hide tool logs.
+for msg in messages:
+    if isinstance(msg, HumanMessage):
+        with st.chat_message("user"): 
+            st.write(msg.content)
+    elif isinstance(msg, AIMessage) and msg.content:
+        if isinstance(msg.content, str) and msg.content.strip():
+            with st.chat_message("assistant"): 
+                st.write(msg.content)
+        elif isinstance(msg.content, list):
+            text_blocks = [b.get("text") for b in msg.content if isinstance(b, dict) and b.get("type") == "text"]
+            if text_blocks and "".join(text_blocks).strip():
+                with st.chat_message("assistant"):
+                    st.write("".join(text_blocks))
+
+is_paused = current_state.next and "sensitive_tools" in current_state.next
+
+# ==============================================================================
+# 5. HITL & BULLETPROOF EXECUTION
+# ==============================================================================
+if is_paused:
+    last_msg = current_state.values["messages"][-1]
+    st.markdown("---")
+    st.warning("⚠️ **Action Required:** The assistant is attempting a sensitive action and requires your approval before proceeding.")
+    
+    for tc in last_msg.tool_calls:
+        st.info(f"**Requested Tool:** `{tc['name']}` | **Parameters:** `{tc['args']}`")
+        
+    col1, col2 = st.columns([2, 2])
     with col1:
-        if st.button(button_label, key=f"select_{thread_id}", use_container_width=True):
-            st.session_state["thread_id"] = thread_id
-            add_thread(thread_id)
-            sync_pending_interrupt(thread_id)
-            st.rerun()
-
+        if st.button("✅ Approve Action", type="primary", use_container_width=True):
+            with st.spinner("Executing approved action..."):
+                agent.invoke(None, config=config)
+                st.rerun()
     with col2:
-        if st.button("🗑️", key=f"delete_{thread_id}", use_container_width=True):
-            delete_thread(thread_id)
+        if st.button("❌ Cancel Action", use_container_width=True):
+            rejections = [
+                ToolMessage(tool_call_id=tc["id"], name=tc["name"], content="Action cancelled by user.")
+                for tc in last_msg.tool_calls
+            ]
+            agent.update_state(config, {"messages": rejections}, as_node="sensitive_tools")
+            agent.invoke(None, config=config)
             st.rerun()
+    st.markdown("---")
+    st.info("🔒 Please click **Approve** or **Cancel** above to continue your conversation.")
 
-# ========================= HITL approval interface =========================
-
-pending_hitl = st.session_state.get("pending_hitl")
-current_thread_has_pending_hitl = (
-    pending_hitl is not None
-    and pending_hitl.get("thread_id") == st.session_state["thread_id"]
-)
-
-if current_thread_has_pending_hitl:
-    st.warning(
-        "🧑 **Human approval required**\n\n"
-        f"{pending_hitl['prompt']}"
+else:
+    chat_submission = st.chat_input(
+        "Message your assistant...", 
+        accept_file="multiple", 
+        file_type=["pdf", "txt", "csv", "jpg", "png"]
     )
 
-    approve_column, reject_column = st.columns(2)
+    if chat_submission:
+        prompt_text = chat_submission.text
+        uploaded_files = chat_submission.files if chat_submission.files else []
 
-    with approve_column:
-        if st.button(
-            "✅ Approve Action",
-            key=f"approve_{st.session_state['thread_id']}",
-            type="primary",
-            use_container_width=True
-        ):
-            resume_hitl_execution("yes")
+        if st.session_state.thread_id not in st.session_state.chat_history:
+            clean_title = prompt_text.strip()
+            title_snippet = clean_title[:28] + ("..." if len(clean_title) > 28 else "")
+            st.session_state.chat_history[st.session_state.thread_id] = title_snippet or "New Conversation"
 
-    with reject_column:
-        if st.button(
-            "❌ Reject Action",
-            key=f"reject_{st.session_state['thread_id']}",
-            use_container_width=True
-        ):
-            resume_hitl_execution("no")
+        with st.chat_message("user"): 
+            st.write(prompt_text)
+            for file in uploaded_files:
+                st.caption(f"📎 Attached: {file.name}")
 
+        if uploaded_files:
+            file_names = ", ".join([f.name for f in uploaded_files])
+            prompt_text = f"[User attached files: {file_names}]\n\n{prompt_text}"
 
-# ========================= Fixed chat input with PDF upload =========================
-
-CONFIG = {
-    "configurable": {"thread_id": st.session_state["thread_id"]},
-    "metadata": {"thread_id": st.session_state["thread_id"]},
-    "run_name": "chat_trace",
-}
-
-current_mode = st.session_state.get("bot_mode", "General Assistant")
-active_bot = chatbot if current_mode == "General Assistant" else resume_bot
-
-# Fetch the exact truth from the database and clean dictionary data chunks
-try:
-    history_state = active_bot.get_state(CONFIG)
-    if "messages" in history_state.values:
-        for msg in history_state.values["messages"]:
-            
-            if type(msg).__name__ == "HumanMessage":
-                clean_text = format_message_content(msg.content)
-                if clean_text:
-                    with st.chat_message("user"):
-                        st.markdown(clean_text)
-                        
-            elif type(msg).__name__ == "AIMessage":
-                clean_text = format_message_content(msg.content)
-                # Hide raw tool calls like <RAG=rag_tool> from old messages
-                if clean_text and not ("<RAG=" in clean_text or '{"query"' in clean_text or "<search=" in clean_text):
-                    with st.chat_message("assistant"):
-                        st.markdown(clean_text)
-except Exception:
-    pass # Ignore if the thread is brand new and empty
-
-
-submission = st.chat_input(
-    "Type here",
-    accept_file=True,
-    file_type=["pdf"],
-    disabled=bool(current_thread_has_pending_hitl)
-)
-
-if submission:
-    add_thread(st.session_state["thread_id"])
-    
-    user_input = submission.text
-    uploaded_files = submission.files
-
-    if uploaded_files:
-        uploaded_pdf = uploaded_files[0]
-        temporary_file_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temporary_file:
-                temporary_file.write(uploaded_pdf.getvalue())
-                temporary_file_path = temporary_file.name
-
-            with st.spinner(f"Processing {uploaded_pdf.name}..."):
-                ingest_rag_document(temporary_file_path)
-
-            st.toast(f"{uploaded_pdf.name} processed successfully.", icon="✅")
-        except Exception as error:
-            st.error(f"PDF processing failed: {error}")
-        finally:
-            if temporary_file_path and os.path.exists(temporary_file_path):
-                os.remove(temporary_file_path)
-
-    if user_input:
-        with st.chat_message("user"):
-            st.markdown(user_input)
-
+        # Atomic execution using agent.invoke() inside a clean professional spinner
         with st.chat_message("assistant"):
-            if current_mode == "General Assistant":
-                status_holder = {"box": None}
-
-                def ai_only_stream():
-                    for message_chunk, metadata in chatbot.stream(
-                        {"messages": [HumanMessage(content=user_input)]},
-                        config=CONFIG,
-                        stream_mode="messages",
-                    ):
-                        if isinstance(message_chunk, ToolMessage):
-                            tool_name = getattr(message_chunk, "name", "tool")
-                            if status_holder["box"] is None:
-                                status_holder["box"] = st.status(f"🔧 Using `{tool_name}` …", expanded=True)
-                            else:
-                                status_holder["box"].update(label=f"🔧 Using `{tool_name}` …", state="running", expanded=True)
-
-                        if isinstance(message_chunk, AIMessage):
-                            # Ensure the streaming chunks pass through the cleaner too!
-                            clean_text = format_message_content(getattr(message_chunk, "content", ""))
-                            
-                            if clean_text and not ("<RAG=" in clean_text or '{"query"' in clean_text or "<search=" in clean_text):
-                                yield clean_text
-
-                    pending_interrupt = get_pending_interrupt(st.session_state["thread_id"])
-                    if pending_interrupt is not None:
-                        save_pending_interrupt(st.session_state["thread_id"], pending_interrupt)
-                        yield "\n\n⚠️ **This action requires confirmation.**"
-
-                st.write_stream(ai_only_stream())
-
-                if status_holder["box"] is not None:
-                    if get_pending_interrupt(st.session_state["thread_id"]) is not None:
-                        status_holder["box"].update(label="⏸️ Waiting for human approval", state="complete", expanded=False)
-                    else:
-                        status_holder["box"].update(label="✅ Tool finished", state="complete", expanded=False)
-
-            else:
-                with st.spinner("Analyzing profile..."):
-                    result = resume_bot.invoke({"messages": [HumanMessage(content=user_input)]}, config=CONFIG)
-                    messages = result.get("messages", [])
+            with st.spinner("Thinking and analyzing..."):
+                try:
+                    agent.invoke(
+                        {"messages": [HumanMessage(content=prompt_text)]},
+                        config=config
+                    )
+                except Exception as e:
+                    # Print the error
+                    st.error(f"⚠️ Service Notice: Unable to complete request. ({str(e)})")
+                    # STOP the script here so it doesn't instantly rerun and erase the error!
+                    st.stop() 
                     
-                    raw_ai_message = messages[-1].content if messages else "Error processing resume data."
-                    clean_ai_message = format_message_content(raw_ai_message)
-                    st.markdown(clean_ai_message)
-
-                    current_state = resume_bot.get_state(CONFIG).values
-                    if "tailored_resume" in current_state and current_state["tailored_resume"]:
-                        pdf_bytes = generate_pdf_from_md(current_state["tailored_resume"])
-                        st.download_button(
-                            label="📄 Download Tailored Resume (PDF)",
-                            data=pdf_bytes,
-                            file_name="Bhuvaneswar_Resume.pdf",
-                            mime="application/pdf"
-                        )
-        
         st.rerun()

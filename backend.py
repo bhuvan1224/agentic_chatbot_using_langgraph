@@ -20,38 +20,35 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
 
 # Import your custom nodes
 from interviewer_node import AgentState, get_interviewer_node
 from tailor_node import get_tailor_node
 
 # ==========================================
-# 1. LOAD ENVIRONMENT & INITIALIZE LLMS
+# 1. LOAD ENVIRONMENT & INITIALIZE LLM
 # ==========================================
 load_dotenv()
 
 # Embeddings model
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+embeddings = GoogleGenerativeAIEmbeddings(model="sentence-transformers/all-MiniLM-L6-v2")
 
-# Initialize your individual models FIRST so they can be used below
-primary_llm = ChatGroq(
-    model="llama-3.1-8b-instant", 
+# 🚀 Use Gemini 1.5 Flash for EVERYTHING (Fast, stable, and massive memory)
+gemini_llm = ChatGoogleGenerativeAI(
+    model="gemini-3.8-flash", 
     temperature=0.0
 )
 
-backup_llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", 
-    temperature=0.0
-)
+# Export this so app.py can use it to generate chat titles!
+primary_llm = gemini_llm
 
 # ==========================================
 # 2. RESUME BUILDER GRAPH
 # ==========================================
 
-# Initialize nodes
-interviewer = get_interviewer_node(primary_llm)
-tailor = get_tailor_node(primary_llm)
+# 💡 Pass Gemini directly into your Resume Builder nodes
+interviewer = get_interviewer_node(gemini_llm)
+tailor = get_tailor_node(gemini_llm)
 
 def route_interviewer(state: AgentState):
     """Checks if the resume is complete. If yes, go to tailor. If no, pause for user input."""
@@ -73,9 +70,7 @@ workflow.add_node("interviewer", interviewer)
 workflow.add_node("tailor", tailor)
 workflow.set_entry_point("interviewer")
 
-# 💡 ROUTING MAP: 
-# When route_interviewer returns "interviewer", send it to END (pause & wait for user).
-# When route_interviewer returns "tailor", move to the tailor node.
+# ROUTING MAP
 workflow.add_conditional_edges(
     "interviewer",
     route_interviewer,
@@ -87,11 +82,10 @@ workflow.add_conditional_edges(
 
 workflow.add_edge("tailor", END)
 
-# 💡 DEFINE CHECKPOINT BEFORE COMPILING
+# DEFINE CHECKPOINT BEFORE COMPILING
 conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
 checkpoint = SqliteSaver(conn)
 
-# Now Python knows what checkpoint is!
 resume_bot = workflow.compile(checkpointer=checkpoint)
 
 
@@ -169,14 +163,11 @@ def get_stock_price(symbol: str) -> dict:
 
 
 @tool
-def purchase_stock(symbol: str, quantity: int) -> dict:
-    """Simulate purchasing a given quantity of a stock symbol (HITL)."""
-    decision = interrupt(f"Approve buying {quantity} shares of {symbol}? (yes/no)")
-
-    if isinstance(decision, str) and decision.lower() == "yes":
-        return {"status": "success", "message": f"Purchase order placed for {quantity} shares of {symbol}.", "symbol": symbol, "quantity": quantity}
-    else:
-        return {"status": "cancelled", "message": f"Purchase of {quantity} shares of {symbol} was declined by human.", "symbol": symbol, "quantity": quantity}
+def purchase_stock(ticker: str, amount: float) -> str:
+    """Buy shares of a stock. ONLY use this tool if the user explicitly commands you to buy stock."""
+    return (f"Simulation Successful: Approved purchase of {amount} shares of {ticker}. "
+            f"Please inform the user: 'This is just a simulation to demonstrate Human-in-the-Loop (HITL) architecture. "
+            f"No real stock was purchased. If you really want to buy stocks, we have to integrate a real broker API later.'")
 
 
 @tool
@@ -212,12 +203,31 @@ def get_current_weather(location: str) -> str:
 
 
 @tool
-def send_email_report(recipient: str, subject: str, body: str) -> dict:
-    """Draft and send an email report to a specific recipient (HITL)."""
-    decision = interrupt(f"Approve sending email to {recipient}? (yes/no)")
-    if isinstance(decision, str) and decision.lower() == "yes":
-        return {"status": "success", "message": f"Email successfully dispatched to {recipient}.", "final_body": body}
-    return {"status": "rejected", "message": "Email broadcast was blocked or cancelled by human supervisor."}
+def send_email_report(recipient: str, subject: str, body_content: str) -> str:
+    """Send a real email report. ONLY use this tool if the user explicitly commands you to email someone."""
+    sender_email = os.getenv("SENDER_EMAIL")
+    sender_password = os.getenv("SENDER_PASSWORD")
+
+    if not sender_email or not sender_password:
+        return "System Error: SENDER_EMAIL or SENDER_PASSWORD missing from .env file. Cannot send real email."
+
+    try:
+        # Create the email structure
+        msg = EmailMessage()
+        msg.set_content(f"{body_content}\n\n---\nSent automatically by Agentic Chatbot")
+        msg['Subject'] = subject
+        msg['From'] = sender_email
+        msg['To'] = recipient
+
+        # Connect to Gmail's server and send
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(sender_email, sender_password)
+            smtp.send_message(msg)
+            
+        return f"Success: A real email was securely sent to {recipient}."
+    
+    except Exception as e:
+        return f"Failed to send email. Error: {str(e)}"
 
 
 @tool
@@ -264,7 +274,6 @@ def send_email_tool(to_email: str, subject: str, body: str) -> str:
 @tool
 def get_future_weather(location: str, days: int = 3) -> str:
     """Fetches future weather predictions and multi-day forecasts."""
-    # NOTE: I swapped this to pull from your .env so you don't get the API error again!
     API_KEY = os.getenv("WEATHERAPI_KEY") 
     url = f"http://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q={location}&days={days}&aqi=no&alerts=no"
     
@@ -292,10 +301,8 @@ tools = [
     send_email_tool, get_future_weather
 ]
 
-primary_with_tools = primary_llm.bind_tools(tools)
-backup_with_tools = backup_llm.bind_tools(tools)
-llm_with_tools = primary_with_tools.with_fallbacks([backup_with_tools])
-
+# Bind tools to Gemini
+llm_with_tools = gemini_llm.bind_tools(tools)
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -361,3 +368,26 @@ if __name__ == "__main__":
             decision = input(f"HITL: {interrupts[0].value} (yes/no): ").strip().lower()
             result = chatbot.invoke(Command(resume=decision), config={"configurable": {"thread_id": thread_id}})
         print(f"Bot: {result['messages'][-1].content}\n")
+
+# Finding the matching jobs
+
+def find_matching_jobs(resume_text: str, target_location: str = "Remote") -> list[dict]:
+    """Extracts core skills and searches live tech openings via Tavily."""
+    # 1. Extract role and top keywords
+    extraction_prompt = (
+        "Based on this resume, identify:\n"
+        "1. The primary target job title (e.g., Python Developer, Data Engineer)\n"
+        "2. The top 3-4 core technical competencies\n"
+        f"Resume:\n{resume_text[:2000]}\n"
+        "Format as a single search query string, e.g.: 'Python LangGraph Generative AI jobs'"
+    )
+    search_query = primary_llm.invoke(extraction_prompt).content.strip()
+
+    # 2. Query live listings via Tavily
+    query_str = f"{search_query} openings {target_location}"
+    search_results = search_tool.invoke({"query": query_str})
+    
+    return {
+        "query_used": query_str,
+        "results": search_results
+    }
